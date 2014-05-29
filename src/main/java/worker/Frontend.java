@@ -18,60 +18,60 @@ import static akka.pattern.Patterns.pipe;
 
 public class Frontend extends UntypedActor {
 
-	final ActorRef mediator = DistributedPubSubExtension.get(getContext().system()).mediator();
 
-	public void onReceive(Object message) {
-		Future<Object> f =
-				ask(mediator, new Send("/user/master/active", message, false),
-						new Timeout(Duration.create(5, "seconds")));
+  final ActorRef mediator = DistributedPubSubExtension.get(getContext().system()).mediator();
 
-		final ExecutionContext ec = getContext().system().dispatcher();
+  public void onReceive(Object message) {
+    Future<Object> f =
+      ask(mediator, new Send("/user/master/active", message, false), new Timeout(Duration.create(5, "seconds")));
 
-		Future<Object> res = f.map(new Mapper<Object, Object>() {
-			@Override
-			public Object apply(Object msg) {
-				if (msg instanceof Master.Ack)
-					return Ok.getInstance();
-				else
-					return super.apply(msg);
-			}
-		}, ec).recover(new Recover<Object>() {
-			@Override
-			public Object recover(Throwable failure) throws Throwable {
-				return NotOk.getInstance();
-			}
-		}, ec);
+    final ExecutionContext ec = getContext().system().dispatcher();
 
-		pipe(res, ec).to(getSender());
-	}
+    Future<Object> res = f.map(new Mapper<Object, Object>() {
+      @Override
+      public Object apply(Object msg) {
+        if (msg instanceof Master.Ack)
+          return Ok.getInstance();
+        else
+          return super.apply(msg);
+      }
+    }, ec).recover(new Recover<Object>() {
+      @Override
+      public Object recover(Throwable failure) throws Throwable {
+        return NotOk.getInstance();
+      }
+    }, ec);
 
-	public static final class Ok implements Serializable {
-		private Ok() {}
+    pipe(res, ec).to(getSender());
+  }
 
-		private static final Ok instance = new Ok();
+  public static final class Ok implements Serializable {
+    private Ok() {}
 
-		public static Ok getInstance() {
-			return instance;
-		}
+    private static final Ok instance = new Ok();
 
-		@Override
-		public String toString() {
-			return "Ok";
-		}
-	};
+    public static Ok getInstance() {
+      return instance;
+    }
 
-	public static final class NotOk implements Serializable {
-		private NotOk() {}
+    @Override
+    public String toString() {
+      return "Ok";
+    }
+  };
 
-		private static final NotOk instance = new NotOk();
+  public static final class NotOk implements Serializable {
+    private NotOk() {}
 
-		public static NotOk getInstance() {
-			return instance;
-		}
+    private static final NotOk instance = new NotOk();
 
-		@Override
-		public String toString() {
-			return "NotOk";
-		}
-	};
+    public static NotOk getInstance() {
+      return instance;
+    }
+
+    @Override
+    public String toString() {
+      return "NotOk";
+    }
+  };
 }
