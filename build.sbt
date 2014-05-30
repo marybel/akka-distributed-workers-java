@@ -5,6 +5,7 @@ version := "0.1"
 scalaVersion := "2.10.3"
 
 libraryDependencies ++= Seq(
+  "com.rabbitmq" % "amqp-client" % "2.8.4",
   "com.typesafe.akka" %% "akka-contrib" % "2.3.0",
   "com.typesafe.akka" %% "akka-testkit" % "2.3.0",
   "junit" % "junit" % "4.11" % "test",

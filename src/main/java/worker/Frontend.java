@@ -6,72 +6,88 @@ import akka.contrib.pattern.DistributedPubSubExtension;
 import akka.contrib.pattern.DistributedPubSubMediator.Send;
 import akka.dispatch.Mapper;
 import akka.dispatch.Recover;
+import akka.event.Logging;
+import akka.event.LoggingAdapter;
 import akka.util.Timeout;
+import java.io.Serializable;
 import scala.concurrent.ExecutionContext;
 import scala.concurrent.Future;
 import scala.concurrent.duration.Duration;
-
-import java.io.Serializable;
 
 import static akka.pattern.Patterns.ask;
 import static akka.pattern.Patterns.pipe;
 
 public class Frontend extends UntypedActor {
+	public static final boolean NO_LOCAL_AFFINITY = false;
+	public static final Timeout TIMEOUT_5_SECONDS = new Timeout(Duration.create(5, "seconds"));
 
+	private LoggingAdapter log = Logging.getLogger(getContext().system(), this);
+	private ActorRef mediator = DistributedPubSubExtension.get(getContext().system()).mediator();
+	private ExecutionContext execContext = getContext().system().dispatcher();
 
-  final ActorRef mediator = DistributedPubSubExtension.get(getContext().system()).mediator();
+	public void onReceive(Object message) {
+		if (message instanceof Master.Work) {
+			Master.Work newWork = (Master.Work) message;
+			Future<Object> mediatorResponseToWork = askMediatorToSendNewWorkToMaster(newWork);
+			Future<Object> responseToNewWork = getResponseToNewWork(mediatorResponseToWork, execContext);
 
-  public void onReceive(Object message) {
-    Future<Object> f =
-      ask(mediator, new Send("/user/master/active", message, false), new Timeout(Duration.create(5, "seconds")));
+			pipe(responseToNewWork, execContext).to(getSender());
+		} else {
+			String errorMsg = "Non Work related message received by Frontend";
+			log.error(errorMsg);
+			throw new RuntimeException(errorMsg);
+		}
+	}
 
-    final ExecutionContext ec = getContext().system().dispatcher();
+	private Future<Object> askMediatorToSendNewWorkToMaster(Master.Work newWork) {
+		return ask(mediator, new Send("/user/master/active", newWork, NO_LOCAL_AFFINITY),
+				TIMEOUT_5_SECONDS);
+	}
 
-    Future<Object> res = f.map(new Mapper<Object, Object>() {
-      @Override
-      public Object apply(Object msg) {
-        if (msg instanceof Master.Ack)
-          return Ok.getInstance();
-        else
-          return super.apply(msg);
-      }
-    }, ec).recover(new Recover<Object>() {
-      @Override
-      public Object recover(Throwable failure) throws Throwable {
-        return NotOk.getInstance();
-      }
-    }, ec);
+	private Future<Object> getResponseToNewWork(Future<Object> mediatorResponseToWork, ExecutionContext execContext) {
+		return mediatorResponseToWork.map(new Mapper<Object, Object>() {
+			@Override
+			public Object apply(Object msg) {
+				if (msg instanceof Master.Ack)
+					return Ok.getInstance();
+				else
+					return super.apply(msg);
+			}
+		}, execContext).recover(new Recover<Object>() {
+			@Override
+			public Object recover(Throwable failure) throws Throwable {
+				return NotOk.getInstance();
+			}
+		}, execContext);
+	}
 
-    pipe(res, ec).to(getSender());
-  }
+	public static final class Ok implements Serializable {
+		private Ok() {}
 
-  public static final class Ok implements Serializable {
-    private Ok() {}
+		private static final Ok instance = new Ok();
 
-    private static final Ok instance = new Ok();
+		public static Ok getInstance() {
+			return instance;
+		}
 
-    public static Ok getInstance() {
-      return instance;
-    }
+		@Override
+		public String toString() {
+			return "Ok";
+		}
+	};
 
-    @Override
-    public String toString() {
-      return "Ok";
-    }
-  };
+	public static final class NotOk implements Serializable {
+		private NotOk() {}
 
-  public static final class NotOk implements Serializable {
-    private NotOk() {}
+		private static final NotOk instance = new NotOk();
 
-    private static final NotOk instance = new NotOk();
+		public static NotOk getInstance() {
+			return instance;
+		}
 
-    public static NotOk getInstance() {
-      return instance;
-    }
-
-    @Override
-    public String toString() {
-      return "NotOk";
-    }
-  };
+		@Override
+		public String toString() {
+			return "NotOk";
+		}
+	};
 }

@@ -9,327 +9,360 @@ import akka.contrib.pattern.DistributedPubSubMediator;
 import akka.contrib.pattern.DistributedPubSubMediator.Put;
 import akka.event.Logging;
 import akka.event.LoggingAdapter;
+import java.io.Serializable;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 import scala.concurrent.duration.Deadline;
 import scala.concurrent.duration.FiniteDuration;
 
-import java.io.Serializable;
-import java.util.*;
-
-import static worker.MasterWorkerProtocol.*;
+import static worker.MasterWorkerProtocol.RegisterWorker;
+import static worker.MasterWorkerProtocol.WorkFailed;
+import static worker.MasterWorkerProtocol.WorkIsDone;
+import static worker.MasterWorkerProtocol.WorkIsReady;
+import static worker.MasterWorkerProtocol.WorkerRequestsWork;
 
 public class Master extends UntypedActor {
 
-  public static String ResultsTopic = "results";
+	public static String ResultsTopic = "results";
 
-  public static Props props(FiniteDuration workTimeout) {
-    return Props.create(Master.class, workTimeout);
-  }
+	public static Props props(FiniteDuration workTimeout) {
+		return Props.create(Master.class, workTimeout);
+	}
 
-  private final FiniteDuration workTimeout;
-  private final ActorRef mediator = DistributedPubSubExtension.get(getContext().system()).mediator();
-  private final LoggingAdapter log = Logging.getLogger(getContext().system(), this);
-  private final Cancellable cleanupTask;
-  private HashMap<String, WorkerState> workers = new HashMap<String, WorkerState>();
-  private Queue<Work> pendingWork = new LinkedList<Work>();
-  private Set<String> workIds = new LinkedHashSet<String>();
+	private final FiniteDuration workTimeout;
+	private final ActorRef mediator = DistributedPubSubExtension.get(getContext().system()).mediator();
+	private final LoggingAdapter log = Logging.getLogger(getContext().system(), this);
+	private final Cancellable cleanupTask;
+	private HashMap<String, WorkerState> workers = new HashMap<String, WorkerState>();
+	private Queue<Work> pendingWork = new LinkedList<Work>();
+	private Set<String> workIds = new LinkedHashSet<String>();
 
-  public Master(FiniteDuration workTimeout) {
-    this.workTimeout = workTimeout;
-    mediator.tell(new Put(getSelf()), getSelf());
-    this.cleanupTask = getContext().system().scheduler().schedule(
-      workTimeout.div(2), workTimeout.div(2), getSelf(), CleanupTick, getContext().dispatcher(), getSelf());
-  }
+	public Master(FiniteDuration workTimeout) {
+		this.workTimeout = workTimeout;
+		mediator.tell(new Put(getSelf()), getSelf());
+		this.cleanupTask = getContext().system().scheduler().schedule(
+				workTimeout.div(2), workTimeout.div(2), getSelf(), CleanupTick, getContext().dispatcher(), getSelf());
+	}
 
-  @Override
-  public void postStop() {
-    cleanupTask.cancel();
-  }
+	@Override
+	public void postStop() {
+		cleanupTask.cancel();
+	}
 
-  @Override
-  public void onReceive(Object message) {
-    if (message instanceof RegisterWorker) {
-      RegisterWorker msg =
-        (RegisterWorker) message;
-      String workerId = msg.workerId;
-      if (workers.containsKey(workerId)) {
-        workers.put(workerId, workers.get(workerId).copyWithRef(getSender()));
-      } else {
-        log.debug("Worker registered: {}", workerId);
-        workers.put(workerId, new WorkerState(getSender(),Idle.instance));
-        if (!pendingWork.isEmpty())
-          getSender().tell(WorkIsReady.getInstance(), getSelf());
-      }
-    }
-    else if (message instanceof WorkerRequestsWork) {
-      WorkerRequestsWork msg = (WorkerRequestsWork) message;
-      String workerId = msg.workerId;
-      if (!pendingWork.isEmpty()) {
-        WorkerState state = workers.get(workerId);
-        if (state != null && state.status.isIdle()) {
-          Work work = pendingWork.remove();
-          log.debug("Giving worker {} some work {}", workerId, work.job);
-          // TODO store in Eventsourced
-          getSender().tell(work, getSelf());
-          workers.put(workerId, state.copyWithStatus(new Busy(work, workTimeout.fromNow())));
-        }
-      }
-    }
-    else if (message instanceof WorkIsDone) {
-      WorkIsDone msg = (WorkIsDone) message;
-      String workerId = msg.workerId;
-      String workId = msg.workId;
-      WorkerState state = workers.get(workerId);
-      if (state != null && state.status.isBusy() && state.status.getWork().workId.equals(workId)) {
-        Work work = state.status.getWork();
-        Object result = msg.result;
-        log.debug("Work is done: {} => {} by worker {}", work, result, workerId);
-        // TODO store in Eventsourced
-        workers.put(workerId, state.copyWithStatus(Idle.instance));
-        mediator.tell(new DistributedPubSubMediator.Publish(ResultsTopic,
-          new WorkResult(workId, result)), getSelf());
-        getSender().tell(new Ack(workId), getSelf());
-      } else {
-        if (workIds.contains(workId)) {
-          // previous Ack was lost, confirm again that this is done
-          getSender().tell(new Ack(workId), getSelf());
-        }
-      }
-    }
-    else if (message instanceof WorkFailed) {
-      WorkFailed msg = (WorkFailed) message;
-      String workerId = msg.workerId;
-      String workId = msg.workId;
-      WorkerState state = workers.get(workerId);
-      if (state != null && state.status.isBusy() && state.status.getWork().workId.equals(workId)) {
-        log.info("Work failed: {}", state.status.getWork());
-        // TODO store in Eventsourced
-        workers.put(workerId, state.copyWithStatus(Idle.instance));
-        pendingWork.add(state.status.getWork());
-        notifyWorkers();
-      }
-    }
-    else if (message instanceof Work) {
-      Work work = (Work) message;
-      // idempotent
-      if (workIds.contains(work.workId)) {
-        getSender().tell(new Ack(work.workId), getSelf());
-      } else {
-        log.debug("Accepted work: {}", work);
-        // TODO store in Eventsourced
-        pendingWork.add(work);
-        workIds.add(work.workId);
-        getSender().tell(new Ack(work.workId), getSelf());
-        notifyWorkers();
-      }
-    }
-    else if (message == CleanupTick) {
-      Iterator<Map.Entry<String, WorkerState>> iterator =
-        workers.entrySet().iterator();
-      while (iterator.hasNext()) {
-        Map.Entry<String, WorkerState> entry = iterator.next();
-        String workerId = entry.getKey();
-        WorkerState state = entry.getValue();
-        if (state.status.isBusy()) {
-          if (state.status.getDeadLine().isOverdue()) {
-            Work work = state.status.getWork();
-            log.info("Work timed out: {}", work);
-            // TODO store in Eventsourced
-            iterator.remove();
-            pendingWork.add(work);
-            notifyWorkers();
-          }
-        }
-      }
-    }
-    else {
-      unhandled(message);
-    }
-  }
+	@Override
+	public void onReceive(Object message) {
+		if (message instanceof RegisterWorker) {
+			registerWorker((RegisterWorker) message);
+		}
+		else if (message instanceof WorkerRequestsWork) {
+			assignWorkToWorker((WorkerRequestsWork) message);
+		}
+		else if (message instanceof WorkIsDone) {
+			receiveWorkDone((WorkIsDone) message);
+		}
+		else if (message instanceof WorkFailed) {
+			retryWorkFailed((WorkFailed) message);
+		}
+		else if (message instanceof Work) {
+			ackNewWork((Work) message);
+		}
+		else if (message == CleanupTick) {
+			doCleanup();
+		}
+		else {
+			unhandled(message);
+		}
+	}
 
-  private void notifyWorkers() {
-    if (!pendingWork.isEmpty()) {
-      // could pick a few random instead of all
-      for (WorkerState state: workers.values()) {
-        if (state.status.isIdle())
-          state.ref.tell(WorkIsReady.getInstance(), getSelf());
-      }
-    }
-  }
+	private void doCleanup() {
+		Iterator<Map.Entry<String, WorkerState>> iterator =
+				workers.entrySet().iterator();
+		while (iterator.hasNext()) {
+			Map.Entry<String, WorkerState> entry = iterator.next();
+			String workerId = entry.getKey();
+			WorkerState state = entry.getValue();
+			if (state.status.isBusy()) {
+				if (state.status.getDeadLine().isOverdue()) {
+					Work work = state.status.getWork();
+					log.info("Work timed out: {}", work);
+					// TODO store in Eventsourced
+					iterator.remove();
+					pendingWork.add(work);
+					notifyWorkers();
+				}
+			}
+		}
+	}
 
-  private static abstract class WorkerStatus {
-    protected abstract boolean isIdle();
-    private boolean isBusy() {
-      return !isIdle();
-    };
-    protected abstract Work getWork();
-    protected abstract Deadline getDeadLine();
-  }
+	private void ackNewWork(Work work) {
+		// idempotent
+		if (workIds.contains(work.workId)) {
+			getSender().tell(new Ack(work.workId), getSelf());
+		} else {
+			log.debug("Accepted work: {}", work);
+			// TODO store in Eventsourced
+			pendingWork.add(work);
+			workIds.add(work.workId);
+			getSender().tell(new Ack(work.workId), getSelf());
+			notifyWorkers();
+		}
+	}
 
-  private static final class Idle extends WorkerStatus {
-    private static final Idle instance = new Idle();
-    public static Idle getInstance() {
-      return instance;
-    }
+	private void receiveWorkDone(WorkIsDone message) {
+		String workerId = message.workerId;
+		String workId = message.workId;
+		WorkerState state = workers.get(workerId);
+		if (state != null && state.status.isBusy() && state.status.getWork().workId.equals(workId)) {
+			Work work = state.status.getWork();
+			Object result = message.result;
+			log.debug("Work is done: {} => {} by worker {}", work, result, workerId);
+			// TODO store in Eventsourced
+			workers.put(workerId, state.copyWithStatus(Idle.instance));
+			mediator.tell(new DistributedPubSubMediator.Publish(ResultsTopic,
+					new WorkResult(workId, result)), getSelf());
+			getSender().tell(new Ack(workId), getSelf());
+		} else {
+			if (workIds.contains(workId)) {
+				// previous Ack was lost, confirm again that this is done
+				getSender().tell(new Ack(workId), getSelf());
+			}
+		}
+	}
 
-    @Override
-    protected boolean isIdle() {
-      return true;
-    }
+	private void assignWorkToWorker(WorkerRequestsWork message) {
+		String workerId = message.workerId;
+		if (!pendingWork.isEmpty()) {
+			WorkerState state = workers.get(workerId);
+			if (state != null && state.status.isIdle()) {
+				Work work = pendingWork.remove();
+				log.debug("Giving worker {} some work {}", workerId, work.job);
+				// TODO store in Eventsourced
+				getSender().tell(work, getSelf());
+				workers.put(workerId, state.copyWithStatus(new Busy(work, workTimeout.fromNow())));
+			}
+		}
+	}
 
-    @Override
-    protected Work getWork() {
-      throw new IllegalAccessError();
-    }
+	private void registerWorker(RegisterWorker message) {
+		String workerId = message.workerId;
+		if (workers.containsKey(workerId)) {
+			workers.put(workerId, workers.get(workerId).copyWithRef(getSender()));
+		} else {
+			log.debug("Worker registered: {}", workerId);
+			workers.put(workerId, new WorkerState(getSender(), Idle.instance));
+			if (!pendingWork.isEmpty())
+				getSender().tell(WorkIsReady.getInstance(), getSelf());
+		}
+	}
 
-    @Override
-    protected Deadline getDeadLine() {
-      throw new IllegalAccessError();
-    }
+	private void retryWorkFailed(WorkFailed message) {
+		String workerId = message.workerId;
+		String workId = message.workId;
+		WorkerState state = workers.get(workerId);
+		if (state != null && state.status.isBusy() && state.status.getWork().workId.equals(workId)) {
+			log.info("Work failed: {}", state.status.getWork());
+			// TODO store in Eventsourced
+			workers.put(workerId, state.copyWithStatus(Idle.instance));
+			pendingWork.add(state.status.getWork());
+			notifyWorkers();
+		}
+	}
 
-    @Override
-    public String toString() {
-      return "Idle";
-    }
-  }
+	private void notifyWorkers() {
+		if (!pendingWork.isEmpty()) {
+			// could pick a few random instead of all
+			for (WorkerState state : workers.values()) {
+				if (state.status.isIdle()) {
+					ActorRef registeredWorker = state.ref;
+					registeredWorker.tell(WorkIsReady.getInstance(), getSelf());
+				}
+			}
+		}
+	}
 
-  private static final class Busy extends WorkerStatus {
-    private final Work work;
-    private final Deadline deadline;
+	private static abstract class WorkerStatus {
+		protected abstract boolean isIdle();
 
-    private Busy(Work work, Deadline deadline) {
-      this.work = work;
-      this.deadline = deadline;
-    }
+		private boolean isBusy() {
+			return !isIdle();
+		};
 
-    @Override
-    protected boolean isIdle() {
-      return false;
-    }
+		protected abstract Work getWork();
 
-    @Override
-    protected Work getWork() {
-      return work;
-    }
+		protected abstract Deadline getDeadLine();
+	}
 
-    @Override
-    protected Deadline getDeadLine() {
-      return deadline;
-    }
+	private static final class Idle extends WorkerStatus {
+		private static final Idle instance = new Idle();
 
-    @Override
-    public String toString() {
-      return "Busy{" +
-        "work=" + work +
-        ", deadline=" + deadline +
-        '}';
-    }
-  }
+		public static Idle getInstance() {
+			return instance;
+		}
 
-  private static final class WorkerState {
-    public final ActorRef ref;
-    public final WorkerStatus status;
+		@Override
+		protected boolean isIdle() {
+			return true;
+		}
 
-    private WorkerState(ActorRef ref, WorkerStatus status) {
-      this.ref = ref;
-      this.status = status;
-    }
+		@Override
+		protected Work getWork() {
+			throw new IllegalAccessError();
+		}
 
-    private WorkerState copyWithRef(ActorRef ref) {
-      return new WorkerState(ref, this.status);
-    }
+		@Override
+		protected Deadline getDeadLine() {
+			throw new IllegalAccessError();
+		}
 
-    private WorkerState copyWithStatus(WorkerStatus status) {
-      return new WorkerState(this.ref, status);
-    }
+		@Override
+		public String toString() {
+			return "Idle";
+		}
+	}
 
-    @Override
-    public boolean equals(Object o) {
-      if (this == o) return true;
-      if (o == null || getClass() != o.getClass()) return false;
+	private static final class Busy extends WorkerStatus {
+		private final Work work;
+		private final Deadline deadline;
 
-      WorkerState that = (WorkerState) o;
+		private Busy(Work work, Deadline deadline) {
+			this.work = work;
+			this.deadline = deadline;
+		}
 
-      if (!ref.equals(that.ref)) return false;
-      if (!status.equals(that.status)) return false;
+		@Override
+		protected boolean isIdle() {
+			return false;
+		}
 
-      return true;
-    }
+		@Override
+		protected Work getWork() {
+			return work;
+		}
 
-    @Override
-    public int hashCode() {
-      int result = ref.hashCode();
-      result = 31 * result + status.hashCode();
-      return result;
-    }
+		@Override
+		protected Deadline getDeadLine() {
+			return deadline;
+		}
 
-    @Override
-    public String toString() {
-      return "WorkerState{" +
-        "ref=" + ref +
-        ", status=" + status +
-        '}';
-    }
-  }
+		@Override
+		public String toString() {
+			return "Busy{" +
+					"work=" + work +
+					", deadline=" + deadline +
+					'}';
+		}
+	}
 
-  private static final Object CleanupTick = new Object() {
-    @Override
-    public String toString() {
-      return "CleanupTick";
-    }
-  };
+	private static final class WorkerState {
+		public final ActorRef ref;
+		public final WorkerStatus status;
 
-  public static final class Work implements Serializable {
-    public final String workId;
-    public final Object job;
+		private WorkerState(ActorRef ref, WorkerStatus status) {
+			this.ref = ref;
+			this.status = status;
+		}
 
-    public Work(String workId, Object job) {
-      this.workId = workId;
-      this.job = job;
-    }
+		private WorkerState copyWithRef(ActorRef ref) {
+			return new WorkerState(ref, this.status);
+		}
 
-    @Override
-    public String toString() {
-      return "Work{" +
-        "workId='" + workId + '\'' +
-        ", job=" + job +
-        '}';
-    }
-  }
+		private WorkerState copyWithStatus(WorkerStatus status) {
+			return new WorkerState(this.ref, status);
+		}
 
-  public static final class WorkResult implements Serializable {
-    public final String workId;
-    public final Object result;
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) return true;
+			if (o == null || getClass() != o.getClass()) return false;
 
-    public WorkResult(String workId, Object result) {
-      this.workId = workId;
-      this.result = result;
-    }
+			WorkerState that = (WorkerState) o;
 
-    @Override
-    public String toString() {
-      return "WorkResult{" +
-        "workId='" + workId + '\'' +
-        ", result=" + result +
-        '}';
-    }
-  }
+			if (!ref.equals(that.ref)) return false;
+			if (!status.equals(that.status)) return false;
 
-  public static final class Ack implements Serializable {
-    final String workId;
+			return true;
+		}
 
-    public Ack(String workId) {
-      this.workId = workId;
-    }
+		@Override
+		public int hashCode() {
+			int result = ref.hashCode();
+			result = 31 * result + status.hashCode();
+			return result;
+		}
 
-    @Override
-    public String toString() {
-      return "Ack{" +
-        "workId='" + workId + '\'' +
-        '}';
-    }
-  }
+		@Override
+		public String toString() {
+			return "WorkerState{" +
+					"ref=" + ref +
+					", status=" + status +
+					'}';
+		}
+	}
 
-  // TODO cleanup old workers
-  // TODO cleanup old workIds
+	private static final Object CleanupTick = new Object() {
+		@Override
+		public String toString() {
+			return "CleanupTick";
+		}
+	};
+
+	public static final class Work implements Serializable {
+		public final String workId;
+		public final Object job;
+
+		public Work(String workId, Object job) {
+			this.workId = workId;
+			this.job = job;
+		}
+
+		@Override
+		public String toString() {
+			return "Work{" +
+					"workId='" + workId + '\'' +
+					", job=" + job +
+					'}';
+		}
+	}
+
+	public static final class WorkResult implements Serializable {
+		public final String workId;
+		public final Object result;
+
+		public WorkResult(String workId, Object result) {
+			this.workId = workId;
+			this.result = result;
+		}
+
+		@Override
+		public String toString() {
+			return "WorkResult{" +
+					"workId='" + workId + '\'' +
+					", result=" + result +
+					'}';
+		}
+	}
+
+	public static final class Ack implements Serializable {
+		final String workId;
+
+		public Ack(String workId) {
+			this.workId = workId;
+		}
+
+		@Override
+		public String toString() {
+			return "Ack{" +
+					"workId='" + workId + '\'' +
+					'}';
+		}
+	}
+
+	// TODO cleanup old workers
+	// TODO cleanup old workIds
 
 }

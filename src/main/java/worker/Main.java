@@ -1,58 +1,38 @@
 package worker;
 
-import akka.actor.*;
-import akka.cluster.Cluster;
-import akka.contrib.pattern.ClusterClient;
-import akka.contrib.pattern.ClusterSingletonManager;
-import com.typesafe.config.Config;
-import com.typesafe.config.ConfigFactory;
+import akka.actor.ActorSystem;
+import akka.actor.Props;
+import com.rabbitmq.client.AMQP;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+import java.io.IOException;
+import messaging.Callback;
+import messaging.ListeningActor;
+import messaging.RabbitMqConnection;
 import scala.concurrent.duration.Duration;
-import scala.concurrent.duration.FiniteDuration;
-
-import java.util.HashSet;
-import java.util.Set;
 
 public class Main {
-  public static void main(String[] args) throws InterruptedException {
-    Address joinAddress = startBackend(null, "backend");
-    Thread.sleep(5000);
-    startBackend(joinAddress, "backend");
-    startWorker(joinAddress);
-    Thread.sleep(5000);
-    startFrontend(joinAddress);
-  }
+	private static final boolean DURABLE = true;
+	private static final boolean NON_EXCLUSIVE = false;
+	private static final boolean NON_AUTO_DELETE = false;
+	private static String systemName = "Workers";
 
-  private static String systemName = "Workers";
-  private static FiniteDuration workTimeout = Duration.create(10, "seconds");
+	public static void main(String[] args) throws Exception {
+		// create the connection
+		Connection connection = RabbitMqConnection.getConnection();
+		// create a channel for the listener and setup the first listener
+		Channel listenChannel1 = connection.createChannel();
+		AMQP.Queue.DeclareOk declareOk = listenChannel1.queueDeclare("", DURABLE, NON_EXCLUSIVE, NON_AUTO_DELETE, null);
+		setupListener(listenChannel1, declareOk.getQueue(),
+				messaging.Config.RABBITMQ_EXCHANGE, new SystemStarter());
+	}
 
-  public static Address startBackend(Address joinAddress, String role) {
-    Config conf = ConfigFactory.parseString("akka.cluster.roles=[" + role + "]").
-      withFallback(ConfigFactory.load());
-    ActorSystem system = ActorSystem.create(systemName, conf);
-    Address realJoinAddress =
-      (joinAddress == null) ? Cluster.get(system).selfAddress() : joinAddress;
-    Cluster.get(system).join(realJoinAddress);
-
-    system.actorOf(ClusterSingletonManager.defaultProps(Master.props(workTimeout), "active",
-      PoisonPill.getInstance(), role), "master");
-
-    return realJoinAddress;
-  }
-
-  public static void startWorker(Address contactAddress) {
-    ActorSystem system = ActorSystem.create(systemName);
-    Set<ActorSelection> initialContacts = new HashSet<ActorSelection>();
-    initialContacts.add(system.actorSelection(contactAddress + "/user/receptionist"));
-    ActorRef clusterClient = system.actorOf(ClusterClient.defaultProps(initialContacts),
-      "clusterClient");
-    system.actorOf(Worker.props(clusterClient, Props.create(WorkExecutor.class)), "worker");
-  }
-
-  public static void startFrontend(Address joinAddress) {
-    ActorSystem system = ActorSystem.create(systemName);
-    Cluster.get(system).join(joinAddress);
-    ActorRef frontend = system.actorOf(Props.create(Frontend.class), "frontend");
-    system.actorOf(Props.create(WorkProducer.class, frontend), "producer");
-    system.actorOf(Props.create(WorkResultConsumer.class), "consumer");
-  }
+	private static void setupListener(Channel channel, String queueName, String exchange, Callback f)
+			throws IOException {
+		channel.queueBind(queueName, exchange, "");
+		ActorSystem system = ActorSystem.create(systemName);
+		system.scheduler().scheduleOnce(Duration.create(2, "seconds"),
+				system.actorOf(Props.create(ListeningActor.class, channel, queueName, f),"listeningActor"), "", system.dispatcher(),
+				null);
+	}
 }
