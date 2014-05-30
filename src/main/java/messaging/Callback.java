@@ -1,5 +1,7 @@
 package messaging;
 
+import akka.actor.Address;
+
 public interface Callback {
-	void methodToCallback(Object message);
+	Address methodToCallback(Object message);
 }

@@ -26,17 +26,22 @@ public class Frontend extends UntypedActor {
 	private ExecutionContext execContext = getContext().system().dispatcher();
 
 	public void onReceive(Object message) {
+		log.info("receiving message: " + message);
 		if (message instanceof Master.Work) {
-			Master.Work newWork = (Master.Work) message;
-			Future<Object> mediatorResponseToWork = askMediatorToSendNewWorkToMaster(newWork);
-			Future<Object> responseToNewWork = getResponseToNewWork(mediatorResponseToWork, execContext);
-
-			pipe(responseToNewWork, execContext).to(getSender());
+			relayWork((Master.Work) message);
 		} else {
 			String errorMsg = "Non Work related message received by Frontend";
 			log.error(errorMsg);
 			throw new RuntimeException(errorMsg);
 		}
+	}
+
+	private void relayWork(Master.Work message) {
+		Master.Work newWork = (Master.Work) message;
+		Future<Object> mediatorResponseToWork = askMediatorToSendNewWorkToMaster(newWork);
+		Future<Object> responseToNewWork = getResponseToNewWork(mediatorResponseToWork, execContext);
+
+		pipe(responseToNewWork, execContext).to(getSender());
 	}
 
 	private Future<Object> askMediatorToSendNewWorkToMaster(Master.Work newWork) {

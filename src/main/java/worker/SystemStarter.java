@@ -22,7 +22,7 @@ public class SystemStarter implements Callback {
 	private static FiniteDuration workTimeout = Duration.create(10, "seconds");
 
 	@Override
-	public void methodToCallback(Object role) {
+	public Address methodToCallback(Object role) {
 		Address joinAddress = startBackend(null, (String) role);
 		try {
 			Thread.sleep(5000);
@@ -33,7 +33,7 @@ public class SystemStarter implements Callback {
 		} catch (InterruptedException e) {
 			throw new RuntimeException(e);
 		}
-
+		return joinAddress;
 	}
 
 	public Address startBackend(Address joinAddress, String role) {
