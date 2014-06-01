@@ -10,6 +10,7 @@ import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import java.io.IOException;
 import messaging.Callback;
+import messaging.Config;
 import messaging.ListeningActor;
 import messaging.RabbitMqConnection;
 import scala.concurrent.duration.Duration;
@@ -27,7 +28,8 @@ public class Main {
 		Connection connection = RabbitMqConnection.getConnection();
 		// create a channel for the listener and setup the first listener
 		Channel listenChannel1 = connection.createChannel();
-		AMQP.Queue.DeclareOk declareOk = listenChannel1.queueDeclare("", DURABLE, NON_EXCLUSIVE, NON_AUTO_DELETE, null);
+		AMQP.Queue.DeclareOk declareOk = listenChannel1.queueDeclare(Config.RABBITMQ_QUEUE, DURABLE, NON_EXCLUSIVE,
+				NON_AUTO_DELETE, null);
 		setupListener(listenChannel1, declareOk.getQueue(),
 				messaging.Config.RABBITMQ_EXCHANGE, new SystemStarter());
 	}

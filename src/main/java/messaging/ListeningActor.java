@@ -5,6 +5,7 @@ import akka.actor.UntypedActor;
 import akka.contrib.pattern.DistributedPubSubExtension;
 import akka.contrib.pattern.DistributedPubSubMediator;
 import akka.dispatch.Mapper;
+import akka.dispatch.OnComplete;
 import akka.dispatch.OnFailure;
 import akka.dispatch.OnSuccess;
 import akka.dispatch.Recover;
@@ -52,8 +53,8 @@ public class ListeningActor extends UntypedActor {
 	}
 
 	private void relayWork(Master.Work newWork) {
-		Future<Object> mediatorResponseToWork = askMediatorToSendNewWorkToMaster(newWork);
-		Future<Object> responseToNewWork = getResponseToNewWork(mediatorResponseToWork, execContext);
+		Future<Object> mastersResponseToWork = askMediatorToSendNewWorkToMaster(newWork);
+		Future<Object> responseToNewWork = getResponseToNewWork(mastersResponseToWork, execContext);
 
 		reply(responseToNewWork);
 	}
@@ -63,26 +64,32 @@ public class ListeningActor extends UntypedActor {
 		responseToNewWork.onSuccess(new OnSuccess<Object>() {
 
 			public void onSuccess(Object v1) {
-				log.info("CALLING OnSuccess");
-				try {
-					channel.basicAck(deliveryTag, SINGLE);
-				} catch (IOException e) {
-
-				}
-
+				log.info("CALLING OnSuccess: " + v1);
 			}
 
 		}, execContext);
 		responseToNewWork.onFailure(new OnFailure() {
-			public void onFailure(Throwable failure){
+			public void onFailure(Throwable failure) {
 				log.info("CALLING OnFailure");
-				try {
-					channel.basicNack(deliveryTag, SINGLE, true);
-				} catch (IOException e) {
-					e.printStackTrace();
-				}
+				nack();
 			}
 		}, execContext);
+
+		responseToNewWork.onComplete(new OnComplete<Object>() {
+			@Override
+			public void onComplete(Throwable failure, Object success) {
+				log.info("CALLING OnComplete: " + success);
+				nack();
+			}
+		}, execContext);
+	}
+
+	private void nack() {
+		try {
+			channel.basicNack(deliveryTag, SINGLE, true);
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
 	}
 
 	private Future<Object> askMediatorToSendNewWorkToMaster(Master.Work newWork) {
@@ -90,8 +97,8 @@ public class ListeningActor extends UntypedActor {
 				TIMEOUT_5_SECONDS);
 	}
 
-	private Future<Object> getResponseToNewWork(Future<Object> mediatorResponseToWork, ExecutionContext execContext) {
-		return mediatorResponseToWork.map(new Mapper<Object, Object>() {
+	private Future<Object> getResponseToNewWork(Future<Object> mastersResponseToNewWork, ExecutionContext execContext) {
+		return mastersResponseToNewWork.map(new Mapper<Object, Object>() {
 			@Override
 			public Object apply(Object msg) {
 				if (msg instanceof Master.Ack)
